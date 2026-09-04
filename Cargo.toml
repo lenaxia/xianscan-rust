@@ -17,6 +17,7 @@ default = []
 directml = ["ort/directml"]
 cuda = ["ort/cuda"]
 coreml = ["ort/coreml"]
+openvino = ["ort/openvino", "ort/load-dynamic"]
 embed-models = []
 embed-web = []
 

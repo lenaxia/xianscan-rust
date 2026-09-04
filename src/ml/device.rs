@@ -19,6 +19,121 @@ static OVERRIDE_CUDA_MEM_LIMIT_MB: LazyLock<Mutex<Option<usize>>> = LazyLock::ne
 // REPORTING AN ACCELERATOR THAT IS NOT ACTUALLY RUNNING (MISSING RUNTIME).
 static CUDA_RUNTIME_FAILED: AtomicBool = AtomicBool::new(false);
 static COREML_RUNTIME_FAILED: AtomicBool = AtomicBool::new(false);
+// SET WHEN AN OPENVINO SESSION FAILS TO COMMIT (MISSING/RUNTIME-MISMATCHED
+// libopenvino, UNSUPPORTED GPU) SO STATUS STOPS REPORTING AN ACCELERATOR
+// THAT IS NOT ACTUALLY RUNNING — SAME LATCH PATTERN AS CUDA/COREML.
+static OPENVINO_RUNTIME_FAILED: AtomicBool = AtomicBool::new(false);
+
+// CANONICAL EXECUTION-PROVIDER NAMES REPORTED BY ONNX RUNTIME.
+pub const EP_CPU: &str = "CPUExecutionProvider";
+pub const EP_OPENVINO: &str = "OpenVINOExecutionProvider";
+
+/// PURE INPUTS FOR DEVICE-PLAN RESOLUTION — EXTRACTED FROM probe_hardware SO THE
+/// DECISION TABLE IS UNIT-TESTABLE WITHOUT GLOBAL STATE (see openvino-test-plan.md).
+pub(crate) struct DeviceInputs {
+    /// LOWERCASED MT_DEVICE VALUE ("" = AUTO).
+    pub env_override: String,
+    /// openvino FEATURE COMPILED IN *AND* RUNTIME HAS NOT LATCHED FAILED.
+    pub openvino_usable: bool,
+    pub cuda_usable: bool,
+    pub coreml_usable: bool,
+    pub dml_compiled: bool,
+    pub dedicated_gpu_name: Option<String>,
+}
+
+/// PURE DECISION TABLE: OVERRIDE DEVICE → PROVIDERS + HUMAN LABEL.
+/// ORDERING: EXPLICIT OVERRIDES FIRST (cpu → cuda → coreml → dml → openvino),
+/// THEN AUTO-DETECTION (dedicated GPU BACKENDS, ELSE OPENVINO iGPU, ELSE CPU).
+pub(crate) fn resolve_device_plan(i: &DeviceInputs) -> (Vec<String>, String) {
+    let cpu = || (vec![EP_CPU.to_string()], "CPU Multi-threaded".to_string());
+
+    if i.env_override == "cpu" || i.env_override == "none" {
+        return cpu();
+    }
+
+    if i.env_override == "cuda" && i.cuda_usable {
+        if let Some(name) = &i.dedicated_gpu_name {
+            return (
+                vec!["CUDAExecutionProvider".to_string(), EP_CPU.to_string()],
+                format!("CUDA Dedicated GPU ({name})"),
+            );
+        }
+    }
+
+    if i.env_override == "coreml" && i.coreml_usable {
+        if let Some(name) = &i.dedicated_gpu_name {
+            return (
+                vec!["CoreMLExecutionProvider".to_string(), EP_CPU.to_string()],
+                format!("CoreML Apple GPU ({name})"),
+            );
+        }
+    }
+
+    if (i.env_override == "dml" || i.env_override == "directml") && i.dml_compiled {
+        if let Some(name) = &i.dedicated_gpu_name {
+            return (
+                vec!["DmlExecutionProvider".to_string(), EP_CPU.to_string()],
+                format!("DirectML Dedicated GPU ({name})"),
+            );
+        }
+    }
+
+    // OPENVINO (INTEL CPU/iGPU/NPU) — REQUIRES THE `openvino` FEATURE AND A USABLE
+    // libopenvino RUNTIME. NO DEDICATED-GPU REQUIREMENT: THE TARGET IS THE iGPU.
+    if (i.env_override == "openvino" || i.env_override == "ov") && i.openvino_usable {
+        return (
+            vec![EP_OPENVINO.to_string(), EP_CPU.to_string()],
+            "OpenVINO Intel Graphics".to_string(),
+        );
+    }
+
+    // AUTO-DETECTION HIERARCHY: PICK THE COMPILED DEDICATED-GPU BACKEND, ELSE THE
+    // OPENVINO ACCELERATOR, ELSE CPU. A BUILD WITH NONE OF THE GPU FEATURES FALLS
+    // THROUGH TO CPU BY CONSTRUCTION.
+    if let Some(name) = &i.dedicated_gpu_name {
+        if i.cuda_usable {
+            return (
+                vec!["CUDAExecutionProvider".to_string(), EP_CPU.to_string()],
+                format!("CUDA Dedicated GPU ({name})"),
+            );
+        }
+        if i.coreml_usable {
+            return (
+                vec!["CoreMLExecutionProvider".to_string(), EP_CPU.to_string()],
+                format!("CoreML Apple GPU ({name})"),
+            );
+        }
+        if i.dml_compiled {
+            return (
+                vec!["DmlExecutionProvider".to_string(), EP_CPU.to_string()],
+                format!("DirectML Dedicated GPU ({name})"),
+            );
+        }
+    }
+    if i.openvino_usable {
+        return (
+            vec![EP_OPENVINO.to_string(), EP_CPU.to_string()],
+            "OpenVINO Intel Graphics".to_string(),
+        );
+    }
+
+    cpu()
+}
+
+/// PER-MODEL PROVIDER OVERRIDE: THE PP-OCR RECOGNITION MODEL IS INCOMPATIBLE WITH
+/// THE OPENVINO 2024.x ONNX FRONTEND (VERIFY EMPIRICALLY — SEE TEST PLAN V2), SO
+/// IT PINNED TO CPU WHENEVER THE PLAN WOULD USE OPENVINO. ALL OTHER MODELS KEEP
+/// THE FULL PROVIDER FALLBACK CHAIN.
+pub(crate) fn effective_providers_for_model(model_tag: &str, providers: &[String]) -> Vec<String> {
+    let uses_openvino = providers.iter().any(|p| p == EP_OPENVINO);
+    let is_recognition = model_tag.contains("rec");
+    if uses_openvino && is_recognition {
+        vec![EP_CPU.to_string()]
+    } else {
+        providers.to_vec()
+    }
+}
+
 static LAST_GPU_ERROR: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 // SHORT-TTL CACHE FOR GPU ENUMERATION. THE LINUX PATH RUNS `nvidia-smi`, WHICH CAN HANG
@@ -394,71 +509,18 @@ pub fn probe_hardware() -> (Vec<String>, String) {
         .unwrap_or_default()
         .to_lowercase();
 
-    let dedicated_gpu = get_dedicated_gpu();
-
     // A GPU BACKEND IS ONLY USABLE IF ITS FEATURE IS COMPILED IN AND ITS RUNTIME
-    // HAS NOT ALREADY FAILED TO INITIALIZE (E.G. MISSING CUDA RUNTIME ON LINUX).
-    let cuda_usable = cfg!(feature = "cuda") && !CUDA_RUNTIME_FAILED.load(Ordering::Relaxed);
-    let coreml_usable = cfg!(feature = "coreml") && !COREML_RUNTIME_FAILED.load(Ordering::Relaxed);
-
-    if env_override == "cpu" || env_override == "none" {
-        return (vec!["CPUExecutionProvider".to_string()], "CPU Multi-threaded".to_string());
-    }
-
-    // CUDA (NVIDIA) — REQUIRES THE `cuda` FEATURE AND A DETECTED NVIDIA GPU.
-    if env_override == "cuda" && cuda_usable {
-        if let Some(dgpu) = &dedicated_gpu {
-            return (
-                vec!["CUDAExecutionProvider".to_string(), "CPUExecutionProvider".to_string()],
-                format!("CUDA Dedicated GPU ({})", dgpu.name),
-            );
-        }
-    }
-
-    // CoreML (APPLE SILICON) — REQUIRES THE `coreml` FEATURE AND A DETECTED GPU.
-    if env_override == "coreml" && coreml_usable {
-        if let Some(dgpu) = &dedicated_gpu {
-            return (
-                vec!["CoreMLExecutionProvider".to_string(), "CPUExecutionProvider".to_string()],
-                format!("CoreML Apple GPU ({})", dgpu.name),
-            );
-        }
-    }
-
-    // DirectML (WINDOWS) — REQUIRES THE `directml` FEATURE AND A DETECTED dGPU.
-    if (env_override == "dml" || env_override == "directml") && cfg!(feature = "directml") {
-        if let Some(dgpu) = &dedicated_gpu {
-            return (
-                vec!["DmlExecutionProvider".to_string(), "CPUExecutionProvider".to_string()],
-                format!("DirectML Dedicated GPU ({})", dgpu.name),
-            );
-        }
-    }
-
-    // AUTO-DETECTION HIERARCHY: PICK THE COMPILED GPU BACKEND, ELSE CPU. A BUILD
-    // WITH NONE OF THE GPU FEATURES FALLS THROUGH TO CPU BY CONSTRUCTION.
-    if let Some(dgpu) = &dedicated_gpu {
-        if cuda_usable {
-            return (
-                vec!["CUDAExecutionProvider".to_string(), "CPUExecutionProvider".to_string()],
-                format!("CUDA Dedicated GPU ({})", dgpu.name),
-            );
-        }
-        if coreml_usable {
-            return (
-                vec!["CoreMLExecutionProvider".to_string(), "CPUExecutionProvider".to_string()],
-                format!("CoreML Apple GPU ({})", dgpu.name),
-            );
-        }
-        if cfg!(feature = "directml") {
-            return (
-                vec!["DmlExecutionProvider".to_string(), "CPUExecutionProvider".to_string()],
-                format!("DirectML Dedicated GPU ({})", dgpu.name),
-            );
-        }
-    }
-
-    (vec!["CPUExecutionProvider".to_string()], "CPU Multi-threaded".to_string())
+    // HAS NOT ALREADY FAILED TO INITIALIZE (E.G. MISSING CUDA ON LINUX, MISSING
+    // OR ABI-MISMATCHED libopenvino FOR OPENVINO).
+    let inputs = DeviceInputs {
+        env_override,
+        openvino_usable: cfg!(feature = "openvino") && !OPENVINO_RUNTIME_FAILED.load(Ordering::Relaxed),
+        cuda_usable: cfg!(feature = "cuda") && !CUDA_RUNTIME_FAILED.load(Ordering::Relaxed),
+        coreml_usable: cfg!(feature = "coreml") && !COREML_RUNTIME_FAILED.load(Ordering::Relaxed),
+        dml_compiled: cfg!(feature = "directml"),
+        dedicated_gpu_name: get_dedicated_gpu().map(|g| g.name),
+    };
+    resolve_device_plan(&inputs)
 }
 
 pub fn get_hardware_status() -> HardwareStatus {
@@ -1118,6 +1180,141 @@ pub fn create_session_from_memory(bytes: &[u8], model_tag: &str) -> Result<Sessi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== OPENVINO DEVICE PLAN (see docs/testing/openvino-test-plan.md) =====
+
+    fn inputs(ov: &str) -> DeviceInputs {
+        DeviceInputs {
+            env_override: ov.to_string(),
+            openvino_usable: false,
+            cuda_usable: false,
+            coreml_usable: false,
+            dml_compiled: false,
+            dedicated_gpu_name: None,
+        }
+    }
+
+    #[test]
+    fn u1_resolves_cpu_when_override_cpu() {
+        let (p, label) = resolve_device_plan(&inputs("cpu"));
+        assert_eq!(p, vec!["CPUExecutionProvider"]);
+        assert_eq!(label, "CPU Multi-threaded");
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn u2_resolves_openvino_when_requested_and_usable() {
+        let mut i = inputs("openvino");
+        i.openvino_usable = true;
+        let (p, label) = resolve_device_plan(&i);
+        assert_eq!(p, vec!["OpenVINOExecutionProvider", "CPUExecutionProvider"]);
+        assert!(label.contains("OpenVINO"), "label was {label}");
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn u3_openvino_alias_ov_accepted() {
+        let mut i = inputs("ov");
+        i.openvino_usable = true;
+        let (p, _) = resolve_device_plan(&i);
+        assert_eq!(p, vec!["OpenVINOExecutionProvider", "CPUExecutionProvider"]);
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn u4_falls_back_to_cpu_when_openvino_runtime_failed() {
+        let mut i = inputs("openvino");
+        i.openvino_usable = false; // runtime latched failed
+        let (p, _) = resolve_device_plan(&i);
+        assert_eq!(p, vec!["CPUExecutionProvider"]);
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn u5_explicit_openvino_ignored_without_feature() {
+        // MIRRORS probe_hardware'S INPUT CONTRACT: usable = feature && runtime-ok.
+        // WITHOUT THE FEATURE THE INPUT CAN NEVER BE usable, EVEN IF A RUNTIME EXISTS.
+        let openvino_usable = cfg!(feature = "openvino") && true;
+        assert!(!openvino_usable);
+        let mut i = inputs("openvino");
+        i.openvino_usable = openvino_usable;
+        let (p, _) = resolve_device_plan(&i);
+        assert_eq!(p, vec!["CPUExecutionProvider"]);
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn u6_auto_prefers_openvino_when_no_dgpu() {
+        let mut i = inputs("");
+        i.openvino_usable = true;
+        let (p, _) = resolve_device_plan(&i);
+        assert_eq!(p, vec!["OpenVINOExecutionProvider", "CPUExecutionProvider"]);
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn u7_auto_prefers_cuda_over_openvino() {
+        let mut i = inputs("");
+        i.openvino_usable = true;
+        i.cuda_usable = true;
+        i.dedicated_gpu_name = Some("NVIDIA GeForce RTX 3090".into());
+        let (p, _) = resolve_device_plan(&i);
+        assert_eq!(p, vec!["CUDAExecutionProvider", "CPUExecutionProvider"]);
+    }
+
+    #[test]
+    fn u8_auto_cpu_when_nothing_usable() {
+        let (p, _) = resolve_device_plan(&inputs(""));
+        assert_eq!(p, vec!["CPUExecutionProvider"]);
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn u9_rec_model_stays_cpu_under_openvino() {
+        let plan = vec![
+            "OpenVINOExecutionProvider".to_string(),
+            "CPUExecutionProvider".to_string(),
+        ];
+        for tag in ["ppocr_rec", "ocr_rec", "rec"] {
+            assert_eq!(
+                effective_providers_for_model(tag, &plan),
+                vec!["CPUExecutionProvider"],
+                "tag {tag}"
+            );
+        }
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn u10_non_rec_models_keep_openvino() {
+        let plan = vec![
+            "OpenVINOExecutionProvider".to_string(),
+            "CPUExecutionProvider".to_string(),
+        ];
+        for tag in ["ppocr_det", "rfdetr", "lama", "ocr_det"] {
+            assert_eq!(
+                effective_providers_for_model(tag, &plan),
+                vec!["OpenVINOExecutionProvider", "CPUExecutionProvider"],
+                "tag {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn u11_rec_uses_normal_providers_under_cpu() {
+        let plan = vec!["CPUExecutionProvider".to_string()];
+        assert_eq!(effective_providers_for_model("ppocr_rec", &plan), plan);
+    }
+
+    #[test]
+    fn u12_regression_cuda_branch_unchanged() {
+        let mut i = inputs("cuda");
+        i.cuda_usable = true;
+        i.dedicated_gpu_name = Some("NVIDIA GeForce RTX 3080".into());
+        let (p, label) = resolve_device_plan(&i);
+        assert_eq!(p, vec!["CUDAExecutionProvider", "CPUExecutionProvider"]);
+        assert!(label.contains("CUDA Dedicated GPU"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
