@@ -1004,9 +1004,12 @@ pub fn trim_process_memory() {
 /// (CUDA, COREML, OR DIRECTML FOR DEDICATED GPUS, WITH AUTOMATIC, GRACEFUL FALLBACK TO MULTI-THREADED CPU).
 pub fn create_session_from_memory(bytes: &[u8], model_tag: &str) -> Result<Session> {
     let (providers, _) = probe_hardware();
+    // PER-MODEL OVERRIDES (E.G. ppocr_rec PINNED TO CPU UNDER OPENVINO).
+    let providers = effective_providers_for_model(model_tag, &providers);
     let wants_cuda = providers.iter().any(|p| p == "CUDAExecutionProvider");
     let wants_coreml = providers.iter().any(|p| p == "CoreMLExecutionProvider");
     let wants_dml = providers.iter().any(|p| p == "DmlExecutionProvider");
+    let wants_openvino = providers.iter().any(|p| p == EP_OPENVINO);
 
     if wants_cuda {
         #[cfg(feature = "cuda")]
@@ -1110,6 +1113,65 @@ pub fn create_session_from_memory(bytes: &[u8], model_tag: &str) -> Result<Sessi
                     *LAST_GPU_ERROR.lock().unwrap() = Some(format!("CoreML init error: {}", e));
                     tracing::warn!(
                         "Failed to initialize ONNX model '{}' with CoreML ({}); falling back to CPU multi-threaded.",
+                        model_tag, e
+                    );
+                }
+            }
+        }
+    }
+
+    if wants_openvino {
+        #[cfg(feature = "openvino")]
+        {
+            // DEVICE SELECTABLE VIA MT_OPENVINO_DEVICE (GPU DEFAULT; CPU FOR
+            // HEADLESS VALIDATION). MODEL CACHE PERSISTS COMPILED BLOBS ACROSS
+            // RESTARTS — FIRST RF-DETR COMPILE ON GEN9 TAKES ~15s, SO /config
+            // IS PREFERRED WHEN WRITABLE.
+            let device_type = std::env::var("MT_OPENVINO_DEVICE").unwrap_or_else(|_| "GPU".to_string());
+            let cache_dir = std::env::var("MT_OPENVINO_CACHE").unwrap_or_else(|_| {
+                let preferred = std::path::Path::new("/config/ov-cache");
+                if preferred.is_dir() {
+                    preferred.to_string_lossy().into_owned()
+                } else {
+                    std::env::temp_dir().join("xianscan-ov-cache").to_string_lossy().into_owned()
+                }
+            });
+            let _ = std::fs::create_dir_all(&cache_dir);
+
+            let ov_res = (|| -> Result<Session> {
+                let session = Session::builder()
+                    .map_err(|e| anyhow::anyhow!("Builder error: {}", e))?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)
+                    .map_err(|e| anyhow::anyhow!("Opt level error: {}", e))?
+                    .with_memory_pattern(false)
+                    .map_err(|e| anyhow::anyhow!("Memory pattern error: {}", e))?
+                    .with_config_entry("session.enable_cpu_mem_arena", "0")
+                    .map_err(|e| anyhow::anyhow!("Config entry error: {}", e))?
+                    .with_execution_providers([
+                        ort::ep::OpenVINO::default()
+                            .with_device_type(&device_type)
+                            .with_cache_dir(&cache_dir)
+                            .build(),
+                    ])
+                    .map_err(|e| anyhow::anyhow!("OpenVINO provider error: {}", e))?
+                    .commit_from_memory(bytes)
+                    .map_err(|e| anyhow::anyhow!("Commit error: {}", e))?;
+                Ok(session)
+            })();
+
+            match ov_res {
+                Ok(s) => {
+                    tracing::info!(
+                        "Successfully initialized ONNX model '{}' with OpenVINO acceleration (device: {}, cache: {}).",
+                        model_tag, device_type, cache_dir
+                    );
+                    return Ok(s);
+                }
+                Err(e) => {
+                    OPENVINO_RUNTIME_FAILED.store(true, Ordering::Relaxed);
+                    *LAST_GPU_ERROR.lock().unwrap() = Some(format!("OpenVINO init error: {}", e));
+                    tracing::warn!(
+                        "Failed to initialize ONNX model '{}' with OpenVINO ({}); falling back to CPU multi-threaded.",
                         model_tag, e
                     );
                 }
